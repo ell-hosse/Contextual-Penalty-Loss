@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class FastCPLoss(nn.Module):
@@ -19,7 +20,7 @@ class FastCPLoss(nn.Module):
         self.from_logits = from_logits
         self.eps = eps
 
-    @torch.cuda.amp.autocast(enabled=False)
+    @torch.amp.autocast("cuda", enabled=False)
     def forward(self, logits: torch.Tensor, target: torch.Tensor):
         if self.from_logits:
             probs = F.softmax(logits.float(), dim=1)

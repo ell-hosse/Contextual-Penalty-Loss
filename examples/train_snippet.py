@@ -15,9 +15,7 @@ S = build_similarity_from_llm(prompt, classes, provider_callback=provider)
 
 criterion = CPLoss(
     S=S,
-    w_cpl=0.7,     # CPL weight
-    w_ce=0.2,      # Cross-entropy weight
-    w_dice=0.1,    # Dice weight
+    alpha=0.2,
     ignore_index=255,
     reduction='mean',
     from_logits=True,
@@ -25,7 +23,7 @@ criterion = CPLoss(
 
 # forward
 N, C, H, W = 2, len(classes), 256, 256
-logits = torch.randn(N, C, H, W, device='cuda')
-target = torch.randint(0, C, (N, H, W), device='cuda')
+logits = torch.randn(N, C, H, W)
+target = torch.randint(0, C, (N, H, W))
 loss = criterion(logits, target)
 loss.backward()

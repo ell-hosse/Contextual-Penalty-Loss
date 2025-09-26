@@ -1,17 +1,21 @@
-# benchmark_cpl.py
-# Compare pixel-wise vs class-wise Contextual Penalty Loss (CPL) timing
-# on synthetic BDD100K-like data (19 classes + ignore=255).
-# Runs 1 epoch twice (pixel-wise then class-wise) and prints timings.
+"""
+benchmark_cpl.py
+Compare pixel-wise vs class-wise Contextual Penalty Loss (CPL) timing
+on synthetic BDD100K-like data (19 classes + ignore=255).
+Runs 1 epoch twice (pixel-wise then class-wise) and prints timings.
+"""
 
-import os, time, math, random
+import time, random
 from typing import List, Tuple, Dict
 
 import numpy as np
-from PIL import Image  # (not used to save, kept for clarity)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+from cploss import CPLoss as CPLossPixelWise
+from cploss import FastCPLoss as CPLossClassWise
 
 # -----------------------------
 # Repro & device
@@ -43,7 +47,7 @@ BDD_COLORS = [
 COLOR2ID: Dict[Tuple[int,int,int], int] = {c:i for i,c in enumerate(BDD_COLORS)}
 
 # -----------------------------
-# Contextual Similarity (S) for BDD100K (as earlier)
+# Contextual Similarity (S) for BDD100K
 # -----------------------------
 GROUPS = {
     "ground": ["road","sidewalk","terrain"],
@@ -113,14 +117,13 @@ class SyntheticBDD(Dataset):
         self.masks = masks
 
         # Build a color mask (for completeness / sanity)
-        # NOTE: not used in training loop; training uses indexed masks
         palette = torch.tensor(BDD_COLORS, dtype=torch.uint8)  # (19,3)
         rgb = torch.zeros(n_samples, H, W, 3, dtype=torch.uint8)
         valid = masks != IGNORE_INDEX
         # map valid indices to colors
         idx_valid = masks[valid]
         rgb[valid] = palette[idx_valid]
-        # ignore stays black (0,0,0); you could mark as 255,255,255 if desired
+        # ignore stays black (0,0,0)
         self.color_masks = rgb
 
     def __len__(self):
@@ -181,123 +184,23 @@ class UNet(nn.Module):
         return self.out(u1)
 
 # -----------------------------
-# CPLoss (Pixel-wise)
-# -----------------------------
-class CPLossPixelWise(nn.Module):
-    """
-    Pixel-wise CPL:
-      cpl = mean_i sum_c p_i(c) * D[y_i, c]    over valid pixels
-    """
-    def __init__(self, S: torch.Tensor, ignore_index=IGNORE_INDEX, reduction='mean', from_logits=True, eps=1e-8):
-        super().__init__()
-        assert S.dim() == 2 and S.size(0) == S.size(1)
-        S = S.clamp(0,1)
-        eye = torch.eye(S.size(0), dtype=S.dtype, device=S.device)
-        self.register_buffer("D", (1.0 - torch.maximum(S, eye)))
-        self.ignore_index = ignore_index
-        self.reduction = reduction
-        self.from_logits = from_logits
-        self.eps = eps
-
-    @torch.cuda.amp.autocast(enabled=False)
-    def forward(self, logits: torch.Tensor, target: torch.Tensor):
-        if self.from_logits:
-            probs = F.softmax(logits.float(), dim=1)
-        else:
-            probs = (logits.float() + self.eps) / (logits.float().sum(dim=1, keepdim=True) + self.eps)
-
-        N, C, H, W = probs.shape
-        probs_flat = probs.permute(0,2,3,1).reshape(-1, C)
-        target_flat = target.reshape(-1).to(logits.device)
-        valid = (target_flat != self.ignore_index)
-
-        if not valid.any():
-            return logits.sum()*0.0
-
-        t_idx = target_flat[valid]              # (M,)
-        D_y = self.D.to(logits.device)[t_idx] # (M,C)
-        p_val = probs_flat[valid]               # (M,C)
-        per_pix = (p_val * D_y).sum(dim=1)      # (M,)
-
-        if self.reduction == 'mean':
-            return per_pix.mean()
-        elif self.reduction == 'sum':
-            return per_pix.sum()
-        else:
-            # return per-pixel map shaped like target
-            full = torch.zeros_like(target_flat, dtype=probs.dtype, device=logits.device)
-            full[valid] = per_pix
-            return full.reshape(target.shape)
-
-# -----------------------------
-# CPLoss (Class-wise via index_add_)
-# -----------------------------
-class CPLossClassWise(nn.Module):
-    """
-    Class-wise CPL:
-      Build S[y,c] = sum_{i: y_i=y} p_i(c)  (accumulate by GT class),
-      then loss = sum_{y,c} S[y,c] * D[y,c] / M_valid
-    """
-    def __init__(self, S: torch.Tensor, ignore_index=IGNORE_INDEX, reduction='mean', from_logits=True, eps=1e-8):
-        super().__init__()
-        assert S.dim() == 2 and S.size(0) == S.size(1)
-        S = S.clamp(0,1)
-        eye = torch.eye(S.size(0), dtype=S.dtype, device=S.device)
-        self.register_buffer("D", (1.0 - torch.maximum(S, eye)))
-        self.ignore_index = ignore_index
-        self.reduction = reduction
-        self.from_logits = from_logits
-        self.eps = eps
-
-    @torch.cuda.amp.autocast(enabled=False)
-    def forward(self, logits: torch.Tensor, target: torch.Tensor):
-        if self.from_logits:
-            probs = F.softmax(logits.float(), dim=1)
-        else:
-            probs = (logits.float() + self.eps) / (logits.float().sum(dim=1, keepdim=True) + self.eps)
-
-        N, C, H, W = probs.shape
-        probs_flat  = probs.permute(0,2,3,1).reshape(-1, C)  # (M,C)
-        target_flat = target.reshape(-1).to(logits.device)
-        valid = (target_flat != self.ignore_index)
-
-        if not valid.any():
-            return logits.sum()*0.0
-
-        t_idx = target_flat[valid]           # (M,)
-        p_val = probs_flat[valid]            # (M,C)
-
-        # Accumulate into a (C,C) table: rows=true class, cols=pred class prob mass
-        Cc = C
-        sum_by_true = torch.zeros(Cc, Cc, device=logits.device, dtype=probs.dtype)
-        sum_by_true.index_add_(0, t_idx, p_val)  # add rows of p_val into row t_idx
-
-        total = (sum_by_true * self.D.to(logits.device)).sum()
-        if self.reduction == 'mean':
-            return total / float(p_val.size(0))
-        elif self.reduction == 'sum':
-            return total
-        else:
-            # No natural per-pixel map; return mean-equivalent
-            return total / float(p_val.size(0))
-
-# -----------------------------
 # Simple train loop for 1 epoch
 # -----------------------------
 def train_one_epoch(model, loader, loss_fn, optimizer, amp=True):
     model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp and DEVICE.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp and DEVICE.type == "cuda"))
 
     start = time.perf_counter()
     for imgs, masks in loader:
         imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=(amp and DEVICE.type == "cuda")):
+        with torch.amp.autocast("cuda", enabled=(amp and DEVICE.type == "cuda")):
             logits = model(imgs)
             loss = loss_fn(logits, masks)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+
     # make timings fair on GPU
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()
@@ -310,9 +213,9 @@ def train_one_epoch(model, loader, loss_fn, optimizer, amp=True):
 def main():
     # Synthetic data (4 samples of 512x512)
     SIZE = 512
-    dataset = SyntheticBDD(n_samples=100, size=SIZE, ignore_ratio=0.05)
+    dataset = SyntheticBDD(n_samples=10, size=SIZE, ignore_ratio=0.05)
     # small batch (2) to create 2 steps/epoch
-    loader = DataLoader(dataset, batch_size=8, shuffle=False, num_workers=0, pin_memory=(DEVICE.type=="cuda"))
+    loader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=0, pin_memory=(DEVICE.type=="cuda"))
 
     # Build similarity & two losses
     S = build_similarity_matrix(BDD_CLASSES).to(DEVICE)
@@ -326,23 +229,22 @@ def main():
     # Save initial weights to replay for class-wise run
     init_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-    # --- Run 1: Pixel-wise ---
+    # Run 1: Pixel-wise
     t1 = train_one_epoch(model, loader, loss_px, opt, amp=True)
-    print(f"[Time] Pixel-wise CPL  (1 epoch, 4 samples): {t1:.3f} s")
+    print(f"[Time] Pixel-wise CPL  (1 epoch, 10 samples): {t1:.3f} s")
 
-    # Reset model & optimizer for second run (fair)
+    # Reset model & optimizer for second run
     model.load_state_dict({k: v.to(DEVICE) for k, v in init_state.items()})
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
 
-    # --- Run 2: Class-wise ---
+    # Run 2: Class-wise
     t2 = train_one_epoch(model, loader, loss_cl, opt, amp=True)
-    print(f"[Time] Class-wise CPL  (1 epoch, 4 samples): {t2:.3f} s")
+    print(f"[Time] Class-wise CPL  (1 epoch, 10 samples): {t2:.3f} s")
 
     # Speed ratio
     ratio = (t1 / max(t2, 1e-9))
     print(f"[Result] Speedup (pixel/class) = {ratio:.2f}×  ( >1.0 means pixel-wise slower )")
 
 if __name__ == "__main__":
-    # Helpful cudnn setting for speed on fixed sizes
     torch.backends.cudnn.benchmark = True
     main()

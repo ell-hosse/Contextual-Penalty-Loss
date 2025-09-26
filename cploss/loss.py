@@ -32,7 +32,7 @@ class CPLoss(nn.Module):
         self.from_logits = from_logits
         self.eps = eps
 
-    @torch.cuda.amp.autocast(enabled=False)
+    @torch.amp.autocast("cuda", enabled=False)
     def forward(self, logits: torch.Tensor, target: torch.Tensor):
         N, C, H, W = logits.shape
         device = logits.device
@@ -45,6 +45,7 @@ class CPLoss(nn.Module):
 
         # flatten spatial dims for vectorized compute
         probs = probs.permute(0, 2, 3, 1).reshape(-1, C) # (N*H*W, C)
+
         target_flat = target.reshape(-1).to(device)
 
         # mask ignored pixels
